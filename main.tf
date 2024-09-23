@@ -1,307 +1,120 @@
-# Configure the AWS Provider
-provider "aws" {
-  region = "us-east-1"
+data "aws_iam_policy_document" "assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
 }
 
-#Retrieve the list of AZs in the current AWS region
-data "aws_availability_zones" "available" {}
-data "aws_region" "current" {}
+data "aws_iam_policy_document" "lambda_s3" {
+  statement {
 
-locals {
-  team        = "api_mgmt_dev"
-  application = "corp_api"
-  server_name = "ec2-${var.environment}-api-${var.variables_sub_az}"
+    sid     = "S3FullAccess"
+    effect  = "Allow"
+    actions = ["s3:*"]
+
+    resources = ["*"]
+  }
 }
 
-#Define the VPC
-resource "aws_vpc" "vpc" {
-  cidr_block = var.vpc_cidr
+data "archive_file" "lambda_zip_file" {
+  type        = "zip"
+  source_file = "index.py"
+  output_path = "index.zip"
+}
 
+resource "aws_s3_bucket" "gets3apilambda" {
+  bucket = "gets3apilambda-terraform"
+  
   tags = {
-    Name        = var.vpc_name
-    Environment = "demo_environment"
-    Terraform   = "true"
-    Region      = data.aws_region.current.name
+    Name        = "terraform project"
+    Environment = "Dev"
   }
 }
 
-#Deploy the private subnets
-resource "aws_subnet" "private_subnets" {
-  for_each          = var.private_subnets
-  vpc_id            = aws_vpc.vpc.id
-  cidr_block        = cidrsubnet(var.vpc_cidr, 8, each.value)
-  availability_zone = tolist(data.aws_availability_zones.available.names)[each.value]
+resource "aws_iam_role" "iam_role_lambda" {
+  name               = "lambda-api-s3-role-terraform"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
 
-  tags = {
-    Name      = each.key
-    Terraform = "true"
+resource "aws_iam_policy" "lambda_policy_s3" {
+  name        = "lambda-api-s3-policy-terraform"
+  description = "Contains S3 full access permission for lambda"
+  policy      = data.aws_iam_policy_document.lambda_s3.json
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_exec_role_attachment" {
+  policy_arn = aws_iam_policy.lambda_policy_s3.arn
+  role       = aws_iam_role.iam_role_lambda.name
+}
+
+resource "aws_lambda_function" "lambda_function" {
+  filename         = "index.zip"
+  function_name    = "gets3-api-terraform"
+  role             = aws_iam_role.iam_role_lambda.arn
+  handler          = "index.lambda_handler"
+  runtime          = "python3.12"
+  timeout          = 120
+  source_code_hash = data.archive_file.lambda_zip_file.output_base64sha256
+}
+
+resource "aws_api_gateway_rest_api" "rest_api" {
+  name = "lamda-restapi-terraform"
+
+  endpoint_configuration {
+    types = ["REGIONAL"]
   }
 }
 
-#Deploy the public subnets
-resource "aws_subnet" "public_subnets" {
-  for_each                = var.public_subnets
-  vpc_id                  = aws_vpc.vpc.id
-  cidr_block              = cidrsubnet(var.vpc_cidr, 8, each.value + 100)
-  availability_zone       = tolist(data.aws_availability_zones.available.names)[each.value]
-  map_public_ip_on_launch = true
-
-  tags = {
-    Name      = each.key
-    Terraform = "true"
-  }
+resource "aws_api_gateway_resource" "rest_api_resource" {
+  parent_id   = aws_api_gateway_rest_api.rest_api.root_resource_id
+  rest_api_id = aws_api_gateway_rest_api.rest_api.id
+  path_part   = "demo-path"
 }
 
-#Create route tables for public and private subnets
-resource "aws_route_table" "public_route_table" {
-  vpc_id = aws_vpc.vpc.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.internet_gateway.id
-    #nat_gateway_id = aws_nat_gateway.nat_gateway.id
-  }
-  tags = {
-    Name      = "demo_public_rtb"
-    Terraform = "true"
-  }
+resource "aws_api_gateway_method" "rest_api_method" {
+  authorization = "NONE"
+  http_method   = "GET"
+  rest_api_id   = aws_api_gateway_rest_api.rest_api.id
+  resource_id   = aws_api_gateway_resource.rest_api_resource.id
 }
 
-resource "aws_route_table" "private_route_table" {
-  vpc_id = aws_vpc.vpc.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    # gateway_id     = aws_internet_gateway.internet_gateway.id
-    nat_gateway_id = aws_nat_gateway.nat_gateway.id
-  }
-  tags = {
-    Name      = "demo_private_rtb"
-    Terraform = "true"
-  }
+resource "aws_api_gateway_integration" "lambda_integration" {
+  http_method             = aws_api_gateway_method.rest_api_method.http_method
+  rest_api_id             = aws_api_gateway_rest_api.rest_api.id
+  resource_id             = aws_api_gateway_resource.rest_api_resource.id
+  type                    = "AWS_PROXY"
+  integration_http_method = "GET"
+  uri                     = aws_lambda_function.lambda_function.invoke_arn
 }
 
-#Create route table associations
-resource "aws_route_table_association" "public" {
-  depends_on     = [aws_subnet.public_subnets]
-  route_table_id = aws_route_table.public_route_table.id
-  for_each       = aws_subnet.public_subnets
-  subnet_id      = each.value.id
-}
+resource "aws_api_gateway_deployment" "api-deployment" {
+  rest_api_id = aws_api_gateway_rest_api.rest_api.id
+  stage_name  = "dev-terraform"
 
-resource "aws_route_table_association" "private" {
-  depends_on     = [aws_subnet.private_subnets]
-  route_table_id = aws_route_table.private_route_table.id
-  for_each       = aws_subnet.private_subnets
-  subnet_id      = each.value.id
-}
-
-#Create Internet Gateway
-resource "aws_internet_gateway" "internet_gateway" {
-  vpc_id = aws_vpc.vpc.id
-  tags = {
-    Name = "demo_igw"
-  }
-}
-
-#Create EIP for NAT Gateway
-resource "aws_eip" "nat_gateway_eip" {
-  domain     = "vpc"
-  depends_on = [aws_internet_gateway.internet_gateway]
-  tags = {
-    Name = "demo_igw_eip"
-  }
-}
-
-#Create NAT Gateway
-resource "aws_nat_gateway" "nat_gateway" {
-  depends_on    = [aws_subnet.public_subnets]
-  allocation_id = aws_eip.nat_gateway_eip.id
-  subnet_id     = aws_subnet.public_subnets["public_subnet_1"].id
-  tags = {
-    Name = "demo_nat_gateway"
-  }
-}
-
-# Terraform Data Block - To Lookup Latest Ubuntu 20.04 AMI Image
-data "aws_ami" "ubuntu" {
-  most_recent = true
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  owners = ["099720109477"]
-}
-
-# Terraform Resource Block - To Build EC2 instance in Public Subnet
-
-resource "aws_instance" "ubuntu_server" {
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = "t3.micro"
-  subnet_id                   = aws_subnet.public_subnets["public_subnet_1"].id
-  security_groups             = [aws_security_group.vpc-ping.id, aws_security_group.ingress-ssh.id, aws_security_group.vpc-web.id]
-  associate_public_ip_address = true
-  key_name                    = aws_key_pair.generated.key_name
-  connection {
-    user        = "ubuntu"
-    private_key = tls_private_key.generated.private_key_pem
-    host        = self.public_ip
-  }
-
-  # Leave the first part of the block unchanged and create our `local-exec` provisioner
-  provisioner "local-exec" {
-    command = "chmod 600 ${local_file.private_key_pem.filename}"
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "sudo rm -rf /tmp",
-      "sudo git clone https://github.com/hashicorp/demo-terraform-101 /tmp",
-      "sudo sh /tmp/assets/setup-web.sh",
-    ]
-  }
-
-  tags = {
-    Name = "Ubuntu EC2 Server"
+  triggers = {
+    redeployment = sha1(jsonencode([
+      aws_api_gateway_resource.rest_api_resource.id,
+      aws_api_gateway_method.rest_api_method.id,
+      aws_api_gateway_integration.lambda_integration.id
+    ]))
   }
 
   lifecycle {
-    ignore_changes = [security_groups]
-  }
-
-}
-
-resource "tls_private_key" "generated" {
-  algorithm = "RSA"
-}
-
-resource "local_file" "private_key_pem" {
-  content  = tls_private_key.generated.private_key_pem
-  filename = "MyAWSKey.pem"
-}
-
-resource "aws_key_pair" "generated" {
-  key_name   = "MyAWSKey"
-  public_key = tls_private_key.generated.public_key_openssh
-
-  lifecycle {
-    ignore_changes = [key_name]
+    create_before_destroy = true
   }
 }
 
-# Security Groups
-
-resource "aws_security_group" "ingress-ssh" {
-  name   = "allow-all-ssh"
-  vpc_id = aws_vpc.vpc.id
-  ingress {
-    cidr_blocks = [
-      "0.0.0.0/0"
-    ]
-    from_port = 22
-    to_port   = 22
-    protocol  = "tcp"
-  }
-  // Terraform removes the default rule
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+resource "aws_lambda_permission" "lambda-api-permission-terraform" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.lambda_function.function_name
+  principal     = "apigateway.amazonaws.com"
+  statement_id  = "AllowExecutionFromAPIGateway"
+  source_arn    = "${aws_api_gateway_rest_api.rest_api.execution_arn}/*/*/*"
 }
 
-# Create Security Group - Web Traffic
-resource "aws_security_group" "vpc-web" {
-  name        = "vpc-web-${terraform.workspace}"
-  vpc_id      = aws_vpc.vpc.id
-  description = "Web Traffic"
-  ingress {
-    description = "Allow Port 80"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "Allow Port 443"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    description = "Allow all ip and ports outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-resource "aws_security_group" "vpc-ping" {
-  name        = "vpc-ping"
-  vpc_id      = aws_vpc.vpc.id
-  description = "ICMP for Ping Access"
-  ingress {
-    description = "Allow ICMP Traffic"
-    from_port   = -1
-    to_port     = -1
-    protocol    = "icmp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  egress {
-    description = "Allow all ip and ports outboun"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-# Terraform Resource Block - To Build Web Server in Public Subnet
-resource "aws_instance" "web_server" {
-  ami           = data.aws_ami.ubuntu.id
-  instance_type = "t3.micro"
-  subnet_id     = aws_subnet.public_subnets["public_subnet_1"].id
-  security_groups = [aws_security_group.vpc-ping.id,
-  aws_security_group.ingress-ssh.id, aws_security_group.vpc-web.id]
-  associate_public_ip_address = true
-  key_name                    = aws_key_pair.generated.key_name
-  connection {
-    user        = "ubuntu"
-    private_key = tls_private_key.generated.private_key_pem
-    host        = self.public_ip
-  }
-
-  # Leave the first part of the block unchanged and create our `local-exec` provisioner
-  provisioner "local-exec" {
-    command = "chmod 600 ${local_file.private_key_pem.filename}"
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "sudo rm -rf /tmp",
-      "sudo git clone https://github.com/hashicorp/demo-terraform-101 /tmp",
-      "sudo sh /tmp/assets/setup-web.sh",
-    ]
-  }
-
-  tags = {
-    Name = "Web EC2 Server"
-  }
-
-  lifecycle {
-    ignore_changes = [security_groups]
-  }
-
+output "invoke_url" {
+  value = aws_api_gateway_deployment.api-deployment.invoke_url
 }
